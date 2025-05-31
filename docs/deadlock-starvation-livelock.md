@@ -21,6 +21,11 @@
    - [Cách phòng tránh](#cách-phòng-tránh-livelock)
 5. [So sánh ba khái niệm](#so-sánh-ba-khái-niệm)
 6. [Best Practices](#best-practices)
+7. [Overhead trong Concurrency](#overhead-trong-concurrency)
+   - [Khái niệm Overhead](#khái-niệm-overhead)
+   - [Các loại Overhead](#các-loại-overhead)
+   - [Ví dụ Overhead trong Go](#ví-dụ-overhead-trong-go)
+   - [Cách đo lường và tối ưu](#cách-đo-lường-và-tối-ưu-overhead)
 
 ---
 
@@ -1062,6 +1067,378 @@ func (dd *DeadlockDetector) CheckForDeadlocks() {
 	}
 }
 ```
+
+---
+
+## Overhead trong Concurrency
+
+### Khái niệm Overhead
+
+**Overhead** trong lập trình đồng thời là chi phí bổ sung (thời gian, bộ nhớ, tài nguyên) mà hệ thống phải trả để thực hiện một tác vụ, ngoài công việc chính cần làm. Overhead là trade-off không thể tránh khỏi khi sử dụng concurrency, nhưng có thể được tối ưu hóa thông qua thiết kế hệ thống thông minh.
+
+### Các loại Overhead
+
+#### 1. Context Switching Overhead
+Chi phí chuyển đổi giữa các goroutine/thread:
+- Lưu và khôi phục trạng thái CPU
+- Thời gian scheduler quyết định goroutine nào chạy tiếp
+- Cache misses khi chuyển đổi context
+
+#### 2. Memory Overhead
+- Bộ nhớ bổ sung cho stack của mỗi goroutine (2KB initial)
+- Metadata của sync primitives (mutex, channel)
+- Garbage collection overhead
+- Memory alignment và padding
+
+#### 3. Synchronization Overhead
+- Chi phí lock/unlock mutex
+- Channel operations (send/receive)
+- Atomic operations
+- Wait group operations
+
+#### 4. Communication Overhead
+- Chi phí truyền data qua channels
+- Network latency trong distributed systems
+- Serialization/deserialization
+- Buffer management
+
+### Ví dụ Overhead trong Go
+
+#### Ví dụ 1: So sánh Direct Access vs Concurrent Access
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// Overhead thấp - direct access
+func directSum(data []int) int {
+	sum := 0
+	for _, v := range data {
+		sum += v
+	}
+	return sum
+}
+
+// Overhead cao - với synchronization
+func concurrentSum(data []int) int {
+	var mu sync.Mutex
+	sum := 0
+	
+	var wg sync.WaitGroup
+	for _, v := range data {
+		wg.Add(1)
+		go func(val int) {
+			defer wg.Done()
+			mu.Lock()         // Synchronization overhead
+			sum += val        // Actual work
+			mu.Unlock()       // Synchronization overhead
+		}(v)
+	}
+	wg.Wait()
+	return sum
+}
+
+// Tối ưu - chia nhỏ công việc
+func optimizedConcurrentSum(data []int, numWorkers int) int {
+	if len(data) < numWorkers {
+		return directSum(data)
+	}
+	
+	chunkSize := len(data) / numWorkers
+	results := make(chan int, numWorkers)
+	
+	for i := 0; i < numWorkers; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if i == numWorkers-1 {
+			end = len(data)
+		}
+		
+		go func(chunk []int) {
+			sum := 0
+			for _, v := range chunk {
+				sum += v
+			}
+			results <- sum
+		}(data[start:end])
+	}
+	
+	totalSum := 0
+	for i := 0; i < numWorkers; i++ {
+		totalSum += <-results
+	}
+	
+	return totalSum
+}
+
+func benchmarkOverhead() {
+	data := make([]int, 1000000)
+	for i := range data {
+		data[i] = i + 1
+	}
+	
+	// Benchmark direct access
+	start := time.Now()
+	directResult := directSum(data)
+	directTime := time.Since(start)
+	
+	// Benchmark concurrent access (high overhead)
+	start = time.Now()
+	concurrentResult := concurrentSum(data)
+	concurrentTime := time.Since(start)
+	
+	// Benchmark optimized concurrent access
+	start = time.Now()
+	optimizedResult := optimizedConcurrentSum(data, 4)
+	optimizedTime := time.Since(start)
+	
+	fmt.Printf("Direct: %d (Time: %v)\n", directResult, directTime)
+	fmt.Printf("Concurrent: %d (Time: %v, Overhead: %.2fx)\n", 
+		concurrentResult, concurrentTime, float64(concurrentTime)/float64(directTime))
+	fmt.Printf("Optimized: %d (Time: %v, Overhead: %.2fx)\n", 
+		optimizedResult, optimizedTime, float64(optimizedTime)/float64(directTime))
+}
+```
+
+#### Ví dụ 2: Channel vs Mutex Overhead
+
+```go
+// Channel-based counter (higher overhead)
+type ChannelCounter struct {
+	ch chan int
+	value int
+}
+
+func NewChannelCounter() *ChannelCounter {
+	c := &ChannelCounter{
+		ch: make(chan int, 1),
+	}
+	c.ch <- 0 // Initialize
+	return c
+}
+
+func (c *ChannelCounter) Increment() {
+	val := <-c.ch
+	c.ch <- val + 1
+}
+
+func (c *ChannelCounter) Value() int {
+	val := <-c.ch
+	c.ch <- val
+	return val
+}
+
+// Mutex-based counter (lower overhead)
+type MutexCounter struct {
+	mu    sync.Mutex
+	value int
+}
+
+func (c *MutexCounter) Increment() {
+	c.mu.Lock()
+	c.value++
+	c.mu.Unlock()
+}
+
+func (c *MutexCounter) Value() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
+}
+
+// Atomic counter (lowest overhead)
+type AtomicCounter struct {
+	value int64
+}
+
+func (c *AtomicCounter) Increment() {
+	atomic.AddInt64(&c.value, 1)
+}
+
+func (c *AtomicCounter) Value() int64 {
+	return atomic.LoadInt64(&c.value)
+}
+```
+
+#### Ví dụ 3: Overhead trong Round Robin Scheduler
+
+```go
+// Trong FairScheduler từ ví dụ trước
+func (fs *FairScheduler) Start() {
+	for {
+		// Overhead: kiểm tra state
+		switch fs.lastServed {
+		case "high":
+			// Overhead: context switching, channel operations
+			select {
+			case task := <-fs.lowPriorityQueue:
+				task()                    // Actual work
+				fs.lastServed = "low"     // State management overhead
+			case task := <-fs.highPriorityQueue:
+				task()
+			}
+		case "low":
+			// Tương tự overhead cho case này
+			select {
+			case task := <-fs.highPriorityQueue:
+				task()
+				fs.lastServed = "high"
+			case task := <-fs.lowPriorityQueue:
+				task()
+			}
+		}
+	}
+}
+```
+
+### Cách đo lường và tối ưu Overhead
+
+#### 1. Profiling và Benchmarking
+
+```go
+// Sử dụng Go's built-in benchmarking
+func BenchmarkDirectSum(b *testing.B) {
+	data := make([]int, 1000)
+	for i := range data {
+		data[i] = i
+	}
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		directSum(data)
+	}
+}
+
+func BenchmarkConcurrentSum(b *testing.B) {
+	data := make([]int, 1000)
+	for i := range data {
+		data[i] = i
+	}
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		concurrentSum(data)
+	}
+}
+
+// Chạy: go test -bench=. -benchmem
+```
+
+#### 2. Strategies để giảm Overhead
+
+**a) Batch Processing**
+```go
+// Thay vì xử lý từng item
+for _, item := range items {
+	go processItem(item) // Overhead cao
+}
+
+// Xử lý theo batch
+chunkSize := 100
+for i := 0; i < len(items); i += chunkSize {
+	end := i + chunkSize
+	if end > len(items) {
+		end = len(items)
+	}
+	go processBatch(items[i:end]) // Overhead thấp hơn
+}
+```
+
+**b) Worker Pool Pattern**
+```go
+type WorkerPool struct {
+	tasks   chan Task
+	workers int
+}
+
+func NewWorkerPool(numWorkers int) *WorkerPool {
+	wp := &WorkerPool{
+		tasks:   make(chan Task, 100),
+		workers: numWorkers,
+	}
+	
+	// Tạo workers một lần, tái sử dụng
+	for i := 0; i < numWorkers; i++ {
+		go wp.worker()
+	}
+	
+	return wp
+}
+
+func (wp *WorkerPool) worker() {
+	for task := range wp.tasks {
+		task() // Không có overhead tạo goroutine mới
+	}
+}
+```
+
+**c) Lock-free Algorithms**
+```go
+// Sử dụng atomic operations thay vì mutex
+type LockFreeCounter struct {
+	value int64
+}
+
+func (c *LockFreeCounter) Increment() int64 {
+	return atomic.AddInt64(&c.value, 1)
+}
+
+func (c *LockFreeCounter) Get() int64 {
+	return atomic.LoadInt64(&c.value)
+}
+```
+
+**d) Buffered Channels**
+```go
+// Unbuffered channel - blocking overhead
+ch := make(chan int)
+
+// Buffered channel - giảm blocking
+ch := make(chan int, 100)
+```
+
+#### 3. Monitoring Overhead
+
+```go
+type OverheadMonitor struct {
+	goroutineCount int64
+	memoryUsage    int64
+	contextSwitches int64
+}
+
+func (om *OverheadMonitor) TrackGoroutines() {
+	for {
+		count := runtime.NumGoroutine()
+		atomic.StoreInt64(&om.goroutineCount, int64(count))
+		time.Sleep(time.Second)
+	}
+}
+
+func (om *OverheadMonitor) GetStats() (int64, int64) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	
+	return atomic.LoadInt64(&om.goroutineCount), int64(m.Alloc)
+}
+```
+
+#### 4. Best Practices để giảm Overhead
+
+1. **Đo lường trước khi tối ưu**: "Premature optimization is the root of all evil"
+2. **Sử dụng đúng tool cho đúng job**:
+   - Atomic cho simple counters
+   - Mutex cho critical sections
+   - Channels cho communication
+3. **Worker pools** thay vì tạo goroutines liên tục
+4. **Batch processing** cho high-throughput scenarios
+5. **Buffered channels** để giảm blocking
+6. **Context với timeout** để tránh resource leaks
+7. **Profile thường xuyên** để phát hiện bottlenecks
 
 ---
 
