@@ -2,16 +2,19 @@ package main
 
 import (
 	"fmt"
+	"sync"
 )
 
 func main() {
-	var data int
+	var wg sync.WaitGroup
 
-	go func ()  {
-		data++
-	}()
-
-	if data == 0 {
-		fmt.Printf("data is %d\n", data)
+	for _, saluation := range []string{"hello", "greetings", "good day"} {
+		wg.Add(1)
+		go func(saluation string) {
+			defer wg.Done()
+			fmt.Println(saluation)
+		}(saluation)
 	}
+	// wg.Wait()
+	// fmt.Printf("done")
 }
