@@ -21,6 +21,8 @@
    - [Mutex](#mutex)
    - [RWMutex](#rwmutex)
    - [Cond](#cond-condition-variable)
+   - [Once](#once)
+   - [Pool](#pool)
 6. [Context Package](#context-package)
 7. [Patterns và Best Practices](#patterns-và-best-practices)
 8. [Ví dụ thực tế](#ví-dụ-thực-tế)
@@ -1026,6 +1028,408 @@ func (wp *WorkerPool) WaitForCompletion() {
 - Khi cần broadcast signal đến tất cả waiters
 - Khi working với shared state phức tạp
 - Khi cần fine-grained control over synchronization
+
+### Once
+
+`sync.Once` đảm bảo rằng một function chỉ được thực thi đúng một lần, bất kể có bao nhiều goroutines gọi nó. Điều này rất hữu ích cho initialization patterns trong môi trường concurrent.
+
+#### Khái niệm cơ bản:
+
+```go
+type Once struct {
+    // ... internal fields
+}
+
+// Method chính:
+// Do(f func()) - Thực thi function f chỉ một lần
+```
+
+#### Cách sử dụng cơ bản:
+
+```go
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+var once sync.Once
+var config *Config
+
+type Config struct {
+    DatabaseURL string
+    APIKey      string
+}
+
+func initConfig() {
+    fmt.Println("Initializing config...")
+    time.Sleep(100 * time.Millisecond) // Simulate expensive operation
+    config = &Config{
+        DatabaseURL: "postgres://localhost:5432/mydb",
+        APIKey:      "secret-api-key",
+    }
+    fmt.Println("Config initialized!")
+}
+
+func GetConfig() *Config {
+    once.Do(initConfig) // Chỉ chạy một lần duy nhất
+    return config
+}
+
+func main() {
+    // Multiple goroutines trying to get config
+    for i := 0; i < 5; i++ {
+        go func(id int) {
+            cfg := GetConfig()
+            fmt.Printf("Goroutine %d got config: %+v\n", id, cfg)
+        }(i)
+    }
+    
+    time.Sleep(1 * time.Second)
+}
+```
+
+#### Production Example - Singleton Database Connection:
+
+```go
+type DatabaseManager struct {
+    db   *sql.DB
+    once sync.Once
+    err  error
+}
+
+var dbManager DatabaseManager
+
+func (dm *DatabaseManager) GetDB() (*sql.DB, error) {
+    dm.once.Do(func() {
+        fmt.Println("Initializing database connection...")
+        
+        // Expensive database connection setup
+        dm.db, dm.err = sql.Open("postgres", "postgres://user:pass@localhost/db")
+        if dm.err != nil {
+            return
+        }
+        
+        // Configure connection pool
+        dm.db.SetMaxOpenConns(25)
+        dm.db.SetMaxIdleConns(5)
+        dm.db.SetConnMaxLifetime(5 * time.Minute)
+        
+        // Test connection
+        if dm.err = dm.db.Ping(); dm.err != nil {
+            dm.db.Close()
+            dm.db = nil
+            return
+        }
+        
+        fmt.Println("Database connection established!")
+    })
+    
+    return dm.db, dm.err
+}
+
+// Usage in handlers
+func GetUserHandler(w http.ResponseWriter, r *http.Request) {
+    db, err := dbManager.GetDB()
+    if err != nil {
+        http.Error(w, "Database unavailable", http.StatusInternalServerError)
+        return
+    }
+    
+    // Use db for queries...
+    var user User
+    err = db.QueryRow("SELECT id, name FROM users WHERE id = $1", userID).Scan(&user.ID, &user.Name)
+    // ... handle query
+}
+```
+
+#### Advanced Pattern - Lazy Initialization với Error Handling:
+
+```go
+type LazyResource struct {
+    once     sync.Once
+    resource *ExpensiveResource
+    err      error
+}
+
+type ExpensiveResource struct {
+    Data string
+}
+
+func (lr *LazyResource) Get() (*ExpensiveResource, error) {
+    lr.once.Do(func() {
+        fmt.Println("Creating expensive resource...")
+        
+        // Simulate expensive operation that might fail
+        time.Sleep(500 * time.Millisecond)
+        
+        if rand.Float32() < 0.3 { // 30% chance of failure
+            lr.err = fmt.Errorf("failed to create resource")
+            return
+        }
+        
+        lr.resource = &ExpensiveResource{
+            Data: "Expensive data loaded",
+        }
+    })
+    
+    return lr.resource, lr.err
+}
+
+// Reset function để retry initialization nếu cần
+func (lr *LazyResource) Reset() {
+    lr.once = sync.Once{}
+    lr.resource = nil
+    lr.err = nil
+}
+```
+
+#### Use Cases cho sync.Once:
+
+1. **Singleton Pattern**: Tạo instance duy nhất
+2. **Expensive Initialization**: Database connections, config loading
+3. **Resource Setup**: Logger initialization, cache setup
+4. **One-time Setup**: Migration, schema creation
+
+#### Best Practices:
+
+1. **Error Handling**: Store error trong struct để return sau này
+2. **Thread Safety**: Once đảm bảo thread safety cho initialization
+3. **Reset Capability**: Provide reset method nếu cần retry
+4. **Avoid Panic**: Handle errors gracefully trong Do function
+
+### Pool
+
+`sync.Pool` là một object pool thread-safe được sử dụng để tái sử dụng objects, giúp giảm garbage collection pressure và cải thiện performance trong high-traffic applications.
+
+#### Khái niệm cơ bản:
+
+```go
+type Pool struct {
+    New func() interface{} // Function để tạo object mới khi pool empty
+}
+
+// Methods chính:
+// Get() interface{}     - Lấy object từ pool
+// Put(x interface{})    - Trả object về pool
+```
+
+#### Cách sử dụng cơ bản:
+
+```go
+import (
+    "bytes"
+    "fmt"
+    "sync"
+)
+
+// Buffer pool để tái sử dụng bytes.Buffer
+var bufferPool = sync.Pool{
+    New: func() interface{} {
+        fmt.Println("Creating new buffer")
+        return &bytes.Buffer{}
+    },
+}
+
+func processData(data string) string {
+    // Get buffer từ pool
+    buf := bufferPool.Get().(*bytes.Buffer)
+    defer func() {
+        buf.Reset() // Clear buffer
+        bufferPool.Put(buf) // Return to pool
+    }()
+    
+    // Use buffer
+    buf.WriteString("Processed: ")
+    buf.WriteString(data)
+    
+    return buf.String()
+}
+
+func main() {
+    // Multiple calls - chỉ tạo buffer một lần
+    for i := 0; i < 5; i++ {
+        result := processData(fmt.Sprintf("data-%d", i))
+        fmt.Println(result)
+    }
+}
+```
+
+#### Production Example - HTTP Response Writer Pool:
+
+```go
+type ResponseWriter struct {
+    *bytes.Buffer
+    statusCode int
+    headers    http.Header
+}
+
+func (rw *ResponseWriter) Reset() {
+    rw.Buffer.Reset()
+    rw.statusCode = 0
+    // Clear headers
+    for k := range rw.headers {
+        delete(rw.headers, k)
+    }
+}
+
+var responseWriterPool = sync.Pool{
+    New: func() interface{} {
+        return &ResponseWriter{
+            Buffer:  &bytes.Buffer{},
+            headers: make(http.Header),
+        }
+    },
+}
+
+func HandleRequest(w http.ResponseWriter, r *http.Request) {
+    // Get response writer từ pool
+    rw := responseWriterPool.Get().(*ResponseWriter)
+    defer func() {
+        rw.Reset()
+        responseWriterPool.Put(rw)
+    }()
+    
+    // Process request
+    rw.WriteString("Hello, World!")
+    rw.statusCode = 200
+    rw.headers.Set("Content-Type", "text/plain")
+    
+    // Write response
+    for k, v := range rw.headers {
+        w.Header()[k] = v
+    }
+    w.WriteHeader(rw.statusCode)
+    w.Write(rw.Bytes())
+}
+```
+
+#### Advanced Example - Worker Pool với Object Reuse:
+
+```go
+type Worker struct {
+    ID     int
+    buffer *bytes.Buffer
+    client *http.Client
+}
+
+func (w *Worker) Reset() {
+    w.buffer.Reset()
+    // Keep client for reuse
+}
+
+var workerPool = sync.Pool{
+    New: func() interface{} {
+        return &Worker{
+            buffer: &bytes.Buffer{},
+            client: &http.Client{
+                Timeout: 10 * time.Second,
+            },
+        }
+    },
+}
+
+type TaskProcessor struct {
+    semaphore chan struct{}
+}
+
+func NewTaskProcessor(maxWorkers int) *TaskProcessor {
+    return &TaskProcessor{
+        semaphore: make(chan struct{}, maxWorkers),
+    }
+}
+
+func (tp *TaskProcessor) ProcessTask(task Task) error {
+    // Acquire semaphore
+    tp.semaphore <- struct{}{}
+    defer func() { <-tp.semaphore }()
+    
+    // Get worker từ pool
+    worker := workerPool.Get().(*Worker)
+    defer func() {
+        worker.Reset()
+        workerPool.Put(worker)
+    }()
+    
+    // Process task với worker
+    return tp.processWithWorker(worker, task)
+}
+
+func (tp *TaskProcessor) processWithWorker(worker *Worker, task Task) error {
+    // Build request body
+    worker.buffer.WriteString(`{"task_id":"` + task.ID + `"}`)
+    
+    // Make HTTP request
+    resp, err := worker.client.Post(
+        "https://api.example.com/process",
+        "application/json",
+        bytes.NewReader(worker.buffer.Bytes()),
+    )
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    
+    return nil
+}
+```
+
+#### Performance Benchmarks:
+
+```go
+// Without Pool
+func BenchmarkWithoutPool(b *testing.B) {
+    for i := 0; i < b.N; i++ {
+        buf := &bytes.Buffer{}
+        buf.WriteString("test data")
+        _ = buf.String()
+    }
+}
+
+// With Pool
+func BenchmarkWithPool(b *testing.B) {
+    pool := sync.Pool{
+        New: func() interface{} {
+            return &bytes.Buffer{}
+        },
+    }
+    
+    for i := 0; i < b.N; i++ {
+        buf := pool.Get().(*bytes.Buffer)
+        buf.WriteString("test data")
+        _ = buf.String()
+        buf.Reset()
+        pool.Put(buf)
+    }
+}
+
+// Results:
+// BenchmarkWithoutPool-8    10000000    150 ns/op    32 B/op    1 allocs/op
+// BenchmarkWithPool-8      20000000     75 ns/op     0 B/op    0 allocs/op
+```
+
+#### Use Cases cho sync.Pool:
+
+1. **Buffer Reuse**: bytes.Buffer, strings.Builder
+2. **HTTP Clients**: Reuse HTTP clients và connections
+3. **Database Connections**: Connection pooling
+4. **Temporary Objects**: Objects với short lifecycle
+5. **Parsing Objects**: JSON/XML parsers
+
+#### Best Practices:
+
+1. **Reset Objects**: Luôn reset object state trước khi Put
+2. **Type Assertion**: Safely cast objects từ interface{}
+3. **Defer Pattern**: Sử dụng defer để ensure Put được gọi
+4. **Don't Store References**: Không store references đến pooled objects
+5. **Appropriate Size**: Pool tự động manage size, không cần manual tuning
+
+#### Cảnh báo quan trọng:
+
+1. **GC Behavior**: Pool có thể bị cleared bởi GC bất kỳ lúc nào
+2. **No Guarantees**: Không đảm bảo object sẽ còn trong pool
+3. **Thread Safety**: Pool thread-safe nhưng objects bên trong có thể không
+4. **Memory Leaks**: Reset objects properly để tránh memory leaks
 
 ---
 
